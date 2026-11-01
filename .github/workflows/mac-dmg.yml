@@ -1,0 +1,74 @@
+name: Mac DMG
+
+# Makes the Mac DMG from the notarized universal zip already on a release,
+# checks it file by file against that zip, and adds it to the release. The zip
+# and latest-mac.yml are not touched: auto-update keeps using the zip.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version, e.g. 1.3.3'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  dmg:
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - name: Download the zip and latest-mac.yml
+        run: gh release download "v$VERSION" --repo "$GITHUB_REPOSITORY" --pattern "File-Arbor-$VERSION-universal.zip" --pattern latest-mac.yml --dir in
+
+      - name: Check the zip against latest-mac.yml
+        shell: bash
+        run: |
+          want=$(grep -A1 "url: File-Arbor-$VERSION-universal.zip" in/latest-mac.yml | awk '/sha512:/ {print $2}')
+          got=$(openssl dgst -sha512 -binary "in/File-Arbor-$VERSION-universal.zip" | base64)
+          echo "latest-mac.yml: $want"
+          echo "zip:            $got"
+          test -n "$want" && test "$want" = "$got"
+
+      - name: Make the DMG and check it
+        shell: bash
+        run: |
+          check() {
+            test "$(/usr/libexec/PlistBuddy -c 'Print CFBundleShortVersionString' "$1/Contents/Info.plist")" = "$VERSION"
+            codesign --verify --deep --strict "$1"
+            codesign -dv "$1" 2>&1 | grep -qx 'TeamIdentifier=5P427K4T66'
+            spctl -a -t exec -vv "$1"
+            xcrun stapler validate "$1"
+          }
+          hashes() { (cd "$1" && find "File Arbor.app" -type f -print0 | sort -z | xargs -0 shasum -a 256); }
+
+          ditto -x -k "in/File-Arbor-$VERSION-universal.zip" app
+          check "app/File Arbor.app"
+
+          # The layout publish.sh's create_dmg makes: a blank image, the app and an Applications link, then compressed.
+          size=$(( $(du -sm "app/File Arbor.app" | cut -f1) + 20 ))
+          hdiutil create -size "${size}m" -volname "File Arbor $VERSION-universal" -fs APFS -type UDIF tmp.dmg
+          mkdir mnt
+          hdiutil attach tmp.dmg -mountpoint mnt -noverify -nobrowse
+          ditto "app/File Arbor.app" "mnt/File Arbor.app"
+          ln -s /Applications mnt/Applications
+          sleep 3
+          for i in 1 2 3 4 5; do hdiutil detach mnt && break; sleep 3; done
+          if mount | grep -q " $PWD/mnt "; then hdiutil detach mnt -force; fi
+          hdiutil convert tmp.dmg -format UDZO -o "File-Arbor-$VERSION-universal.dmg"
+
+          mkdir chk
+          hdiutil attach "File-Arbor-$VERSION-universal.dmg" -readonly -noverify -nobrowse -mountpoint chk
+          test -L chk/Applications
+          diff <(hashes app) <(hashes chk)
+          check "chk/File Arbor.app"
+          echo "$(find "chk/File Arbor.app" -type f | wc -l) files, identical to the zip's app"
+          hdiutil detach chk
+          ls -l "File-Arbor-$VERSION-universal.dmg"
+          shasum -a 256 "File-Arbor-$VERSION-universal.dmg"
+
+      - name: Add the DMG to the release
+        run: gh release upload "v$VERSION" "File-Arbor-$VERSION-universal.dmg" --repo "$GITHUB_REPOSITORY" --clobber
